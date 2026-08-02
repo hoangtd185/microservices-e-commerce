@@ -111,14 +111,60 @@ POST   /api/products           { "sku": "X-1", "name": "Thing", "price": 9.99, "
 PATCH  /api/products/{id}/restock   { "quantity": 10 }
 
 POST   /api/orders             { "userId": "...", "productId": "...", "quantity": 2 }
+       header: Idempotency-Key: <uuid>       (optional, strongly recommended)
 GET    /api/orders?userId=...
 GET    /api/orders/{id}
+GET    /api/reservations/{orderId}    what inventory decided, and why
 
 GET    /api/notifications?userId=...
 ```
 
-Seeded products include `LIMITED-01` with a stock of 2 — order 5 of them to see the
-rejection + cancellation path.
+The seeded catalog is 100 products. `LIMITED-01` (stock 2) and the `FLASH-*` SKUs are
+deliberately scarce — order 5 of `LIMITED-01` to see the rejection + cancellation path.
+`FLASH-100` holds 100 units and exists as a load-test target.
+
+## Correctness: the two things that stop double-charging
+
+**Idempotency keys (order-service).** Send `Idempotency-Key: <uuid>` with `POST /api/orders`
+and a retry returns the *same* order instead of creating a second one:
+
+```powershell
+$key = [guid]::NewGuid().ToString()
+# send this twice - one order, and the second response carries Idempotent-Replay: true
+```
+
+The key row and the order are written in **one transaction**, so either both exist or
+neither does. A concurrent duplicate blocks on the primary-key index until the first
+commits, so a double-clicked Buy button is resolved by Postgres rather than by a race in
+JavaScript. Reusing a key with a different body returns 422 — that's a client bug worth
+surfacing, not hiding. The gateway forwards the header; forgetting that is the classic
+way to make idempotency silently stop working.
+
+**Atomic conditional UPDATE (inventory-service).** Stock is decremented with one statement:
+
+```sql
+UPDATE products SET stock = stock - $1, reserved = reserved + $1
+ WHERE id = $2 AND stock >= $1
+RETURNING stock;
+```
+
+Zero rows affected means insufficient stock. No `SELECT ... FOR UPDATE` held across
+statements, no version column, no retry loop. When two requests race for the last items,
+the second one blocks only for the duration of that single statement, then re-evaluates
+`stock >= $1` against the committed row and correctly matches nothing.
+
+Why not the alternatives:
+
+| | Behaviour under a flash sale |
+| --- | --- |
+| Optimistic (version column) | Most requests conflict and retry, retries conflict again — retry storm |
+| Pessimistic (`FOR UPDATE`) | Correct, but serialises on the row for the whole transaction; the connection pool dies first |
+| **Atomic conditional UPDATE** | One statement, no lock held across round trips, no retries |
+
+The `reservations` table doubles as the idempotency record for inventory: `orderId` is the
+primary key, and the row stores the decision. If the service commits the decrement and
+then crashes before publishing, redelivery **replays the stored outcome** instead of
+recomputing it — otherwise the order would sit in `PENDING` forever.
 
 ## Topics
 
@@ -134,6 +180,22 @@ rejection + cancellation path.
 Message keys are the order id (or user id), so all events about one order land on the
 same partition and are therefore processed in order. Each service uses its own
 consumer group, so each service gets its own copy of every event.
+
+## Seeding
+
+The catalog is generated deterministically, so every run produces the same 100 SKUs.
+Seeding runs automatically on boot (`SEED_PRODUCTS=true`) and never touches the stock of
+SKUs that already exist. To re-run it by hand, or to reset stock between load tests:
+
+```bash
+docker compose exec inventory-service node dist/seed/seed.js
+docker compose exec inventory-service node dist/seed/seed.js --reset-stock
+```
+
+Locally: `cd services/inventory-service && npm run seed -- --reset-stock`.
+
+It's a single `INSERT ... ON CONFLICT` rather than a read-then-write loop — the same
+reasoning as the stock decrement.
 
 ## Working on one service locally
 
@@ -161,6 +223,17 @@ npm run start:dev                             # uses localhost:29092 by default
 - **A crashed consumer is not a lost event.** Stop notification-service, place orders,
   start it again — it resumes from its committed offset and processes the backlog.
   That durability is the reason to use Kafka over an in-memory bus.
+
+## Known gaps (deliberate, and worth fixing next)
+
+- **No transactional outbox.** Both services commit to Postgres and *then* publish to
+  Kafka. A crash in between loses the event. Inventory papers over this by replaying
+  stored outcomes on redelivery; the real fix is writing events to an `outbox` table in
+  the same transaction and relaying them with CDC.
+- **Reservations expire but nothing reaps them.** `expiresAt` is recorded so abandoned
+  checkouts can be released, but the reaper needs a matching cancellation event to keep
+  order-service in step — a good exercise.
+- **No dead-letter topic.** A consumer that keeps throwing blocks its partition forever.
 
 ## Next steps to learn from
 

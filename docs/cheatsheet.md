@@ -40,7 +40,9 @@ Or just open http://localhost:8080 (Kafka UI) and click around.
 ```bash
 docker compose exec postgres psql -U postgres -l              # list databases
 docker compose exec postgres psql -U postgres -d orders_db -c "select id, status, quantity from orders;"
-docker compose exec postgres psql -U postgres -d inventory_db -c "select sku, stock, reserved from products;"
+docker compose exec postgres psql -U postgres -d orders_db -c "select key, \"orderId\" from idempotency_keys;"
+docker compose exec postgres psql -U postgres -d inventory_db -c "select sku, stock, reserved from products where sku like 'FLASH%';"
+docker compose exec postgres psql -U postgres -d inventory_db -c "select \"orderId\", status, reason from reservations;"
 docker compose exec postgres psql -U postgres -d notifications_db -c "select topic, message from notifications order by \"createdAt\" desc limit 10;"
 ```
 
@@ -70,6 +72,32 @@ docker compose logs -f inventory-service
 
 All three join the same consumer group (`inventory-service-group`), so each partition
 is handed to exactly one of them — that is how you scale a Kafka consumer.
+
+**Prove the atomic update holds.** Reset the load-test SKU, then fire concurrent orders
+for more units than exist and count how many were confirmed:
+
+```bash
+docker compose exec inventory-service node dist/seed/seed.js --reset-stock
+# FLASH-100 is back to 100 units - now oversubscribe it and check the totals
+docker compose exec postgres psql -U postgres -d inventory_db \
+  -c "select sku, stock, reserved from products where sku = 'FLASH-100';"
+```
+
+`stock + reserved` must always equal 100. If it doesn't, you have an overselling bug.
+
+**Prove idempotency works.** Send the same key twice and compare order ids:
+
+```bash
+KEY=$(uuidgen)
+for i in 1 2; do
+  curl -sS -X POST http://localhost:3000/api/orders \
+    -H 'content-type: application/json' -H "Idempotency-Key: $KEY" \
+    -d '{"userId":"<uuid>","productId":"<uuid>","quantity":1}' | jq -r .id
+done
+```
+
+Two identical ids = one purchase. Two different ids = the header isn't reaching
+order-service, almost always because the gateway dropped it.
 
 **Break the sync path.** Stop user-service and try to place an order — order-service
 fails fast with 400 and no event is published. Compare that with stopping

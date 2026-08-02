@@ -32,6 +32,12 @@ export const ROUTES: RouteRule[] = [
     rewrite: '/products',
   },
   {
+    name: 'inventory-service',
+    prefix: '/api/reservations',
+    target: process.env.INVENTORY_SERVICE_URL ?? 'http://localhost:3003',
+    rewrite: '/reservations',
+  },
+  {
     name: 'notification-service',
     prefix: '/api/notifications',
     target: process.env.NOTIFICATION_SERVICE_URL ?? 'http://localhost:3004',

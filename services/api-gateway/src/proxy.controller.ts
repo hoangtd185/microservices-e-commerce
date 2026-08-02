@@ -54,6 +54,11 @@ export class ProxyController {
             ...(req.headers.authorization
               ? { authorization: req.headers.authorization }
               : {}),
+            // Must be forwarded or the client's retry protection silently
+            // stops working at the gateway.
+            ...(req.headers['idempotency-key']
+              ? { 'idempotency-key': req.headers['idempotency-key'] as string }
+              : {}),
           },
           // Let 4xx from the service flow through untouched instead of throwing.
           validateStatus: () => true,
@@ -66,7 +71,13 @@ export class ProxyController {
 
       res
         .status(upstream.status)
-        .set({ 'x-served-by': rule.name, 'x-request-id': requestId })
+        .set({
+          'x-served-by': rule.name,
+          'x-request-id': requestId,
+          ...(upstream.headers['idempotent-replay']
+            ? { 'idempotent-replay': String(upstream.headers['idempotent-replay']) }
+            : {}),
+        })
         .json(upstream.data);
     } catch (err: any) {
       // The service is down / unreachable: that is a gateway-level failure.

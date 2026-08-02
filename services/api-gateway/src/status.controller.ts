@@ -26,8 +26,11 @@ export class StatusController {
   /** Fan out to every service so one call tells you what is up. */
   @Get('health')
   async health() {
+    // A service can own more than one prefix - check each service once.
+    const services = [...new Map(ROUTES.map((r) => [r.target, r])).values()];
+
     const checks = await Promise.all(
-      ROUTES.map(async (r) => {
+      services.map(async (r) => {
         try {
           const res = await firstValueFrom(
             this.http.get(`${r.target}/health`, { timeout: 3000 }),

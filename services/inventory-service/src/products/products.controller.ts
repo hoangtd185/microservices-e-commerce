@@ -26,3 +26,14 @@ export class ProductsController {
     return this.products.restock(id, dto);
   }
 }
+
+@Controller('reservations')
+export class ReservationsController {
+  constructor(private readonly products: ProductsService) {}
+
+  /** What did inventory decide for this order, and why? */
+  @Get(':orderId')
+  findOne(@Param('orderId') orderId: string) {
+    return this.products.findReservation(orderId);
+  }
+}
