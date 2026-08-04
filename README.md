@@ -181,6 +181,40 @@ Message keys are the order id (or user id), so all events about one order land o
 same partition and are therefore processed in order. Each service uses its own
 consumer group, so each service gets its own copy of every event.
 
+## Tests
+
+No test framework to install — Node 18+ has `fetch` built in, and the harness is
+~200 lines. The stack must be running.
+
+```bash
+docker compose up -d
+npm test          # 25 e2e tests through the gateway
+npm run test:load # concurrency / oversell tests
+```
+
+Everything runs against **real Postgres and real Kafka** through the gateway on :3000,
+because that is the only way to catch the bugs that actually happen here. The worst bug
+found in this project so far — TypeORM returning `[rows, rowCount]` for a raw `UPDATE`,
+so a success was read as "out of stock" — is invisible to a unit test with a mocked
+repository. It fails loudly in an e2e test.
+
+Each test mints its own user and its own product, so runs never interfere with each
+other and you never need to reset between runs.
+
+The concurrency suite oversubscribes one product and asserts three invariants:
+
+1. stock never goes negative
+2. confirmed units never exceed the stock that existed at the start
+3. `stock + reserved` is conserved — nothing created, nothing lost
+
+Invariant 3 is the strict one: a lost-update bug (read, modify in JS, write back) breaks
+it even when the first two happen to look fine.
+
+```bash
+ORDERS=500 QTY=1 STOCK=200 node tests/concurrency.test.js   # turn up the pressure
+SKU=FLASH-100 node tests/concurrency.test.js                # hammer a seeded SKU instead
+```
+
 ## Seeding
 
 The catalog is generated deterministically, so every run produces the same 100 SKUs.
@@ -215,6 +249,13 @@ npm run start:dev                             # uses localhost:29092 by default
   rebalance or redeploy. Consumers must be idempotent. Here: order-service ignores
   events for orders that already left `PENDING`, and inventory-service keeps a
   `reservations` table keyed by `orderId`.
+- **TypeORM's raw `UPDATE` returns a different shape.** `manager.query()` returns
+  `raw.rows` for most statements, but for `UPDATE` and `DELETE` it returns
+  `[rows, rowCount]`. So `result.length` is always 2 and a check like
+  `result.length === 1` silently never matches. Every conditional update here is
+  wrapped in a CTE (`WITH x AS (UPDATE ... RETURNING ...) SELECT * FROM x`) so the
+  outer command is a `SELECT` and the result shape is unambiguous — still one
+  atomic statement.
 - **`synchronize: true` in TypeORM is for demos.** It rewrites your schema on boot.
   Real projects use generated migrations.
 - **Two listeners on Kafka.** `kafka:9092` works inside the Docker network,
@@ -254,6 +295,9 @@ npm run start:dev                             # uses localhost:29092 by default
 docker-compose.yml            infra + all five services
 infra/postgres/init.sql       creates the four databases
 scripts/demo.ps1 | .sh        end-to-end walkthrough
+tests/e2e.test.js             25 tests through the gateway
+tests/concurrency.test.js     oversell / lost-update invariants
+tests/lib/harness.js          tiny zero-dependency test runner
 services/api-gateway/         routing table + proxy handler
 services/user-service/        users, publishes user.created
 services/order-service/       the saga coordinator

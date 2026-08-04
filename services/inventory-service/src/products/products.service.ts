@@ -63,10 +63,13 @@ export class ProductsService implements OnModuleInit {
    */
   async restock(id: string, dto: RestockDto): Promise<Product> {
     const rows = await this.dataSource.query(
-      `UPDATE products
-          SET stock = stock + $1, "updatedAt" = now()
-        WHERE id = $2
-      RETURNING id`,
+      `WITH restocked AS (
+         UPDATE products
+            SET stock = stock + $1, "updatedAt" = now()
+          WHERE id = $2
+         RETURNING id
+       )
+       SELECT id FROM restocked`,
       [dto.quantity, id],
     );
     if (rows.length === 0) throw new NotFoundException(`Product ${id} not found`);
@@ -123,14 +126,23 @@ export class ProductsService implements OnModuleInit {
       // statement only; a concurrent UPDATE that was blocked here re-evaluates
       // `stock >= $1` against the committed row (EvalPlanQual), so the second
       // request correctly sees the reduced stock and matches zero rows.
+      //
+      // The UPDATE is wrapped in a CTE on purpose. TypeORM special-cases raw
+      // UPDATE/DELETE and returns [rows, rowCount] instead of just rows, so
+      // `result.length` would always be 2 and never match. Wrapping it makes
+      // the outer command a SELECT, which returns rows normally - and the
+      // whole thing is still one atomic statement.
       const updated: Array<{ stock: number }> = await manager.query(
-        `UPDATE products
-            SET stock    = stock - $1,
-                reserved = reserved + $1,
-                "updatedAt" = now()
-          WHERE id = $2
-            AND stock >= $1
-        RETURNING stock`,
+        `WITH decremented AS (
+           UPDATE products
+              SET stock    = stock - $1,
+                  reserved = reserved + $1,
+                  "updatedAt" = now()
+            WHERE id = $2
+              AND stock >= $1
+           RETURNING stock
+         )
+         SELECT stock FROM decremented`,
         [event.quantity, event.productId],
       );
 

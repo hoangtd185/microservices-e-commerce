@@ -9,6 +9,14 @@
     "down": "docker compose down",
     "reset": "docker compose down -v",
     "logs": "docker compose logs -f order-service inventory-service notification-service user-service",
-    "health": "curl -sS http://localhost:3000/health"
+    "health": "curl -sS http://localhost:3000/health",
+    "test": "node tests/e2e.test.js",
+    "test:load": "node tests/concurrency.test.js",
+    "test:all": "node tests/e2e.test.js && node tests/concurrency.test.js",
+    "seed": "docker compose exec inventory-service node dist/seed/seed.js",
+    "seed:reset": "docker compose exec inventory-service node dist/seed/seed.js --reset-stock"
+  },
+  "engines": {
+    "node": ">=18"
   }
 }
