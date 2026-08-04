@@ -17,19 +17,19 @@ docker compose up --build order-service   # rebuild one service after a code cha
 
 ```bash
 # list topics
-docker compose exec kafka /opt/bitnami/kafka/bin/kafka-topics.sh \
+docker compose exec kafka /opt/kafka/bin/kafka-topics.sh \
   --bootstrap-server localhost:9092 --list
 
 # describe a topic (partitions, offsets)
-docker compose exec kafka /opt/bitnami/kafka/bin/kafka-topics.sh \
+docker compose exec kafka /opt/kafka/bin/kafka-topics.sh \
   --bootstrap-server localhost:9092 --describe --topic order.created
 
 # tail every message on a topic from the beginning
-docker compose exec kafka /opt/bitnami/kafka/bin/kafka-console-consumer.sh \
+docker compose exec kafka /opt/kafka/bin/kafka-console-consumer.sh \
   --bootstrap-server localhost:9092 --topic order.created --from-beginning
 
 # consumer groups and how far behind they are (LAG is the number to watch)
-docker compose exec kafka /opt/bitnami/kafka/bin/kafka-consumer-groups.sh \
+docker compose exec kafka /opt/kafka/bin/kafka-consumer-groups.sh \
   --bootstrap-server localhost:9092 --describe --all-groups
 ```
 
