@@ -102,26 +102,61 @@ Poll `GET /api/orders/{id}` a second later and you'll see `PENDING → CONFIRMED
 ## API (all through the gateway on :3000)
 
 ```http
-POST   /api/users              { "email": "ada@example.com", "name": "Ada" }
-GET    /api/users
-GET    /api/users/{id}
-
+PUBLIC
+POST   /api/auth/register      { "email": "ada@example.com", "name": "Ada", "password": "..." }
+POST   /api/auth/login         { "email": "ada@example.com", "password": "..." }
 GET    /api/products
+
+AUTHENTICATED   (header: Authorization: Bearer <token>)
+GET    /api/users/{id}
 POST   /api/products           { "sku": "X-1", "name": "Thing", "price": 9.99, "stock": 5 }
 PATCH  /api/products/{id}/restock   { "quantity": 10 }
 
-POST   /api/orders             { "userId": "...", "productId": "...", "quantity": 2 }
+POST   /api/orders             { "productId": "...", "quantity": 2 }
        header: Idempotency-Key: <uuid>       (optional, strongly recommended)
-GET    /api/orders?userId=...
-GET    /api/orders/{id}
+GET    /api/orders                    only your own
+GET    /api/orders/{id}               404 if it is not yours
 GET    /api/reservations/{orderId}    what inventory decided, and why
-
 GET    /api/notifications?userId=...
 ```
+
+Note what is missing from `POST /api/orders`: **`userId`**. Identity comes from the
+token, never from the body. A field the client controls can never be an identity.
 
 The seeded catalog is 100 products. `LIMITED-01` (stock 2) and the `FLASH-*` SKUs are
 deliberately scarce — order 5 of `LIMITED-01` to see the rejection + cancellation path.
 `FLASH-100` holds 100 units and exists as a load-test target.
+
+## Auth: JWT at the gateway
+
+user-service **signs** tokens, the gateway **verifies** them, and services never parse a
+JWT at all. After verification the gateway forwards the proven identity downstream as
+plain headers:
+
+```
+Authorization: Bearer <jwt>   →   gateway verifies   →   x-user-id: <uuid>
+                                                          x-user-email: ...
+```
+
+Three details that matter more than the code:
+
+1. **Deny by default.** Everything under `/api` needs a token except an explicit list
+   (`register`, `login`, `GET /products`). Forget to list a new route and it is merely
+   locked, never accidentally public.
+2. **The gateway deletes any `x-user-*` header the client sent**, before routing.
+   Without that line, anyone can add `x-user-id: <victim>` and become that person.
+   There is a test for exactly this attack.
+3. **Authentication ≠ authorisation.** A valid token proves who you are, not that a
+   given order is yours. `GET /api/orders/{id}` returns 404 — not 403 — for someone
+   else's order, so the response does not confirm that the id exists.
+
+Passwords use **scrypt** from Node's standard library (memory-hard, no native module to
+compile), stored as `salt:hash`, compared in constant time, and the column is
+`select: false` so it cannot leak into a response by accident. Argon2id is the modern
+first choice if you want to swap it.
+
+Login returns the same error for "no such email" and "wrong password" — different
+messages let an attacker enumerate which accounts exist.
 
 ## Correctness: the two things that stop double-charging
 
@@ -162,9 +197,60 @@ Why not the alternatives:
 | **Atomic conditional UPDATE** | One statement, no lock held across round trips, no retries |
 
 The `reservations` table doubles as the idempotency record for inventory: `orderId` is the
-primary key, and the row stores the decision. If the service commits the decrement and
-then crashes before publishing, redelivery **replays the stored outcome** instead of
-recomputing it — otherwise the order would sit in `PENDING` forever.
+primary key, so a redelivered `order.created` cannot decrement stock twice.
+
+## The transactional outbox
+
+**No service ever calls Kafka from its business logic.** Look for `kafka.emit` in
+order-service or inventory-service — it isn't there.
+
+The problem: a service cannot atomically write to Postgres *and* publish to Kafka. Two
+systems, two commits, no shared transaction. Crash in between and you get an order that
+exists but that nobody was ever told about.
+
+The fix: don't publish. Write the event into an `outbox` table **inside the same
+transaction** as the business data. One commit, one system, atomic. A relay reads the
+table afterwards and publishes.
+
+```ts
+await this.dataSource.transaction(async (manager) => {
+  const order = await manager.save(manager.create(Order, draft));
+  await manager.update(IdempotencyKey, { key }, { orderId: order.id });
+  await this.outbox.record(manager, { topic: 'order.created', key: order.id, payload });
+});
+// no broker call anywhere in the request path
+```
+
+Two things this buys beyond correctness:
+
+- **The request got faster.** A broker round trip left the hot path entirely; all that
+  remains is one extra INSERT into an already-open transaction.
+- **A workaround disappeared.** inventory-service used to replay a stored outcome on
+  redelivery, purely to paper over the crash-between-commit-and-publish gap. With an
+  outbox the gap doesn't exist, so that code is gone.
+
+**Transaction discipline in the relay** — nothing slow ever runs inside a transaction:
+
+| Step | Transaction? |
+| --- | --- |
+| Claim a batch (`FOR UPDATE SKIP LOCKED`, sets a lease) | one statement |
+| Publish to Kafka | **none open** |
+| Mark published | one statement |
+
+`SKIP LOCKED` means several relay instances can share the table without blocking or
+double-sending. If a relay dies mid-publish, the lease expires after 30s and another
+pass retries — at-least-once, which is what Kafka gives you anyway, so consumers already
+cope.
+
+The relay polls here to keep the stack small. Production usually swaps it for
+change-data-capture (Debezium tailing the Postgres WAL), which removes polling entirely
+— but the contract is identical, so the business code never changes.
+
+```sql
+-- watch it work
+SELECT id, topic, "publishedAt" FROM outbox ORDER BY id DESC LIMIT 10;
+SELECT count(*) FROM outbox WHERE "publishedAt" IS NULL;   -- backlog; should sit at 0
+```
 
 ## Topics
 
@@ -188,7 +274,7 @@ No test framework to install — Node 18+ has `fetch` built in, and the harness 
 
 ```bash
 docker compose up -d
-npm test          # 25 e2e tests through the gateway
+npm test          # 36 e2e tests through the gateway
 npm run test:load # concurrency / oversell tests
 ```
 
@@ -267,14 +353,18 @@ npm run start:dev                             # uses localhost:29092 by default
 
 ## Known gaps (deliberate, and worth fixing next)
 
-- **No transactional outbox.** Both services commit to Postgres and *then* publish to
-  Kafka. A crash in between loses the event. Inventory papers over this by replaying
-  stored outcomes on redelivery; the real fix is writing events to an `outbox` table in
-  the same transaction and relaying them with CDC.
+- **No dead-letter topic.** A consumer that keeps throwing blocks its partition forever.
+  Retry N times, then publish to `<topic>.dlq` and move on.
 - **Reservations expire but nothing reaps them.** `expiresAt` is recorded so abandoned
   checkouts can be released, but the reaper needs a matching cancellation event to keep
   order-service in step — a good exercise.
-- **No dead-letter topic.** A consumer that keeps throwing blocks its partition forever.
+- **No refresh tokens.** Access tokens last an hour and there is no rotation or
+  revocation. Real auth needs a refresh flow and a way to kill a session.
+- **Symmetric JWT signing.** Gateway and user-service share one secret, so the gateway
+  *could* mint tokens. RS256 splits that: only user-service holds the private key.
+- **No distributed tracing.** One request crosses four services and you cannot see it as
+  a single timeline. OpenTelemetry + Jaeger is the highest-value thing left.
+- **`synchronize: true`** still rewrites the schema on boot. Migrations before production.
 
 ## Next steps to learn from
 
@@ -295,7 +385,7 @@ npm run start:dev                             # uses localhost:29092 by default
 docker-compose.yml            infra + all five services
 infra/postgres/init.sql       creates the four databases
 scripts/demo.ps1 | .sh        end-to-end walkthrough
-tests/e2e.test.js             25 tests through the gateway
+tests/e2e.test.js             36 tests through the gateway
 tests/concurrency.test.js     oversell / lost-update invariants
 tests/lib/harness.js          tiny zero-dependency test runner
 services/api-gateway/         routing table + proxy handler

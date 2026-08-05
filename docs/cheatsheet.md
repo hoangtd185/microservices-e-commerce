@@ -41,6 +41,8 @@ Or just open http://localhost:8080 (Kafka UI) and click around.
 docker compose exec postgres psql -U postgres -l              # list databases
 docker compose exec postgres psql -U postgres -d orders_db -c "select id, status, quantity from orders;"
 docker compose exec postgres psql -U postgres -d orders_db -c "select key, \"orderId\" from idempotency_keys;"
+docker compose exec postgres psql -U postgres -d orders_db -c "select id, topic, \"publishedAt\" from outbox order by id desc limit 10;"
+docker compose exec postgres psql -U postgres -d orders_db -c "select count(*) as backlog from outbox where \"publishedAt\" is null;"
 docker compose exec postgres psql -U postgres -d inventory_db -c "select sku, stock, reserved from products where sku like 'FLASH%';"
 docker compose exec postgres psql -U postgres -d inventory_db -c "select \"orderId\", status, reason from reservations;"
 docker compose exec postgres psql -U postgres -d notifications_db -c "select topic, message from notifications order by \"createdAt\" desc limit 10;"
@@ -84,6 +86,31 @@ docker compose exec postgres psql -U postgres -d inventory_db \
 ```
 
 `stock + reserved` must always equal 100. If it doesn't, you have an overselling bug.
+
+**Prove the outbox never loses an event.** Stop Kafka, place orders, restart it. The
+orders are accepted and their events queue up in Postgres instead of vanishing:
+
+```bash
+docker compose stop kafka
+# place an order through the gateway - it still returns 201
+docker compose exec postgres psql -U postgres -d orders_db \
+  -c "select count(*) from outbox where \"publishedAt\" is null;"   # backlog grows
+docker compose start kafka
+# a few seconds later the backlog drains to 0 and the orders reach CONFIRMED
+```
+
+That is the whole point: the broker being down is no longer a data-loss event.
+
+**Get a token for manual curl-ing:**
+
+```bash
+TOKEN=$(curl -sS -X POST http://localhost:3000/api/auth/register \
+  -H 'content-type: application/json' \
+  -d '{"email":"me@example.com","name":"Me","password":"a-long-enough-password"}' \
+  | jq -r .accessToken)
+
+curl -sS http://localhost:3000/api/orders -H "Authorization: Bearer $TOKEN" | jq
+```
 
 **Prove idempotency works.** Send the same key twice and compare order ids:
 

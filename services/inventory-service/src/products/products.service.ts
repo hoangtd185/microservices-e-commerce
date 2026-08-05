@@ -1,18 +1,10 @@
-import {
-  Inject,
-  Injectable,
-  Logger,
-  NotFoundException,
-  OnModuleInit,
-} from '@nestjs/common';
+import { Injectable, Logger, NotFoundException } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
-import { ClientKafka } from '@nestjs/microservices';
-import { firstValueFrom } from 'rxjs';
 import { DataSource, Repository } from 'typeorm';
 import { Product } from './product.entity';
 import { Reservation, ReservationStatus } from './reservation.entity';
 import { CreateProductDto, RestockDto } from './dto/product.dto';
-import { KAFKA_PRODUCER } from '../kafka/kafka.module';
+import { OutboxService } from '../outbox/outbox.service';
 import {
   TOPICS,
   OrderCreatedEvent,
@@ -25,20 +17,16 @@ import {
 const RESERVATION_TTL_MINUTES = 15;
 
 @Injectable()
-export class ProductsService implements OnModuleInit {
+export class ProductsService {
   private readonly logger = new Logger(ProductsService.name);
 
   constructor(
     @InjectRepository(Product) private readonly products: Repository<Product>,
     @InjectRepository(Reservation)
     private readonly reservations: Repository<Reservation>,
-    @Inject(KAFKA_PRODUCER) private readonly kafka: ClientKafka,
     private readonly dataSource: DataSource,
+    private readonly outbox: OutboxService,
   ) {}
-
-  async onModuleInit() {
-    await this.kafka.connect();
-  }
 
   // ------------------------------------------------------------- read API ---
 
@@ -92,7 +80,7 @@ export class ProductsService implements OnModuleInit {
    *    held across statements, no version column, no retry loop.
    */
   async handleOrderCreated(event: OrderCreatedEvent): Promise<void> {
-    const decision = await this.dataSource.transaction(async (manager) => {
+    await this.dataSource.transaction(async (manager) => {
       // --- claim the order id -------------------------------------------
       // ON CONFLICT DO NOTHING. If another delivery of this same event is
       // mid-flight, this INSERT blocks on the index until that transaction
@@ -112,13 +100,14 @@ export class ProductsService implements OnModuleInit {
         ],
       );
 
-      const isFirstDelivery = claim.length > 0;
-
-      if (!isFirstDelivery) {
-        const existing = await manager.findOne(Reservation, {
-          where: { orderId: event.orderId },
-        });
-        return { replayed: true, reservation: existing };
+      if (claim.length === 0) {
+        // Already handled. Nothing to redo, and nothing to re-publish either:
+        // the first delivery wrote its outcome to the outbox in this same
+        // transaction, so the event is guaranteed to go out exactly once.
+        // (Before the outbox existed this branch had to replay the stored
+        // outcome, because a crash between COMMIT and emit lost the event.)
+        this.logger.log(`order ${event.orderId} already processed, skipping`);
+        return;
       }
 
       // --- the atomic decrement ------------------------------------------
@@ -171,70 +160,38 @@ export class ProductsService implements OnModuleInit {
         { status, reason, remainingStock },
       );
 
-      const reservation = await manager.findOne(Reservation, {
-        where: { orderId: event.orderId },
-      });
-      return { replayed: false, reservation };
+      // --- the outcome goes into the outbox, in THIS transaction ---
+      // One extra INSERT. No broker round trip while locks are held.
+      if (status === ReservationStatus.RESERVED) {
+        const payload: InventoryReservedEvent = {
+          orderId: event.orderId,
+          userId: event.userId,
+          productId: event.productId,
+          quantity: event.quantity,
+          remainingStock,
+        };
+        await this.outbox.record(manager, {
+          topic: TOPICS.INVENTORY_RESERVED,
+          key: event.orderId,
+          payload: payload as any,
+        });
+        this.logger.log(`reserved ${event.quantity} for order ${event.orderId}`);
+      } else {
+        const payload: InventoryRejectedEvent = {
+          orderId: event.orderId,
+          userId: event.userId,
+          productId: event.productId,
+          quantity: event.quantity,
+          reason: reason ?? 'REJECTED',
+        };
+        await this.outbox.record(manager, {
+          topic: TOPICS.INVENTORY_REJECTED,
+          key: event.orderId,
+          payload: payload as any,
+        });
+        this.logger.warn(`rejected order ${event.orderId}: ${reason}`);
+      }
     });
-
-    await this.publishOutcome(event, decision.reservation, decision.replayed);
-  }
-
-  /**
-   * Publishing happens after the transaction commits, which leaves a gap: if
-   * this process dies right here, the decision is durable but nobody was told.
-   * That is why a redelivery replays the stored outcome instead of skipping it.
-   * (The complete fix is the transactional outbox - see the README.)
-   */
-  private async publishOutcome(
-    event: OrderCreatedEvent,
-    reservation: Reservation | null,
-    replayed: boolean,
-  ): Promise<void> {
-    if (!reservation) return;
-
-    const tag = replayed ? 'REPLAY' : 'new';
-
-    if (reservation.status === ReservationStatus.RESERVED) {
-      const payload: InventoryReservedEvent = {
-        orderId: event.orderId,
-        userId: event.userId,
-        productId: event.productId,
-        quantity: event.quantity,
-        remainingStock: reservation.remainingStock,
-      };
-      await firstValueFrom(
-        this.kafka.emit(TOPICS.INVENTORY_RESERVED, {
-          key: event.orderId,
-          value: payload,
-        }),
-      );
-      this.logger.log(`-> ${TOPICS.INVENTORY_RESERVED} ${event.orderId} [${tag}]`);
-      return;
-    }
-
-    if (reservation.status === ReservationStatus.REJECTED) {
-      const payload: InventoryRejectedEvent = {
-        orderId: event.orderId,
-        userId: event.userId,
-        productId: event.productId,
-        quantity: event.quantity,
-        reason: reservation.reason ?? 'REJECTED',
-      };
-      await firstValueFrom(
-        this.kafka.emit(TOPICS.INVENTORY_REJECTED, {
-          key: event.orderId,
-          value: payload,
-        }),
-      );
-      this.logger.warn(
-        `-> ${TOPICS.INVENTORY_REJECTED} ${event.orderId}: ${reservation.reason} [${tag}]`,
-      );
-      return;
-    }
-
-    // RELEASED: the order was already cancelled and the stock handed back.
-    this.logger.log(`order ${event.orderId} already released, nothing to publish`);
   }
 
   /**
