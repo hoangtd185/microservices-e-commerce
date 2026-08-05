@@ -1,58 +1,53 @@
 import {
   ConflictException,
-  Inject,
   Injectable,
   Logger,
   NotFoundException,
-  OnModuleInit,
 } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
-import { ClientKafka } from '@nestjs/microservices';
-import { firstValueFrom } from 'rxjs';
-import { Repository } from 'typeorm';
+import { DataSource, Repository } from 'typeorm';
 import { User } from './user.entity';
 import { CreateUserDto } from './dto/create-user.dto';
-import { KAFKA_PRODUCER } from '../kafka/kafka.module';
+import { OutboxService } from '../outbox/outbox.service';
 import { TOPICS, UserCreatedEvent, OrderConfirmedEvent } from '../events/contracts';
 
 @Injectable()
-export class UsersService implements OnModuleInit {
+export class UsersService {
   private readonly logger = new Logger(UsersService.name);
 
   constructor(
     @InjectRepository(User) private readonly repo: Repository<User>,
-    @Inject(KAFKA_PRODUCER) private readonly kafka: ClientKafka,
+    private readonly dataSource: DataSource,
+    private readonly outbox: OutboxService,
   ) {}
 
-  async onModuleInit() {
-    await this.kafka.connect();
-  }
-
+  /** Passwordless creation, for admin/seed use. Public signup is /auth/register. */
   async create(dto: CreateUserDto): Promise<User> {
     const existing = await this.repo.findOne({ where: { email: dto.email } });
     if (existing) {
       throw new ConflictException(`Email ${dto.email} is already registered`);
     }
 
-    const user = await this.repo.save(this.repo.create(dto));
+    return this.dataSource.transaction(async (manager) => {
+      const user = await manager.save(manager.create(User, dto));
 
-    const event: UserCreatedEvent = {
-      userId: user.id,
-      email: user.email,
-      name: user.name,
-      createdAt: user.createdAt.toISOString(),
-    };
-    // key = userId, so all events for one user land on the same partition and
-    // are therefore consumed in order.
-    //
-    // emit() returns a COLD observable: without awaiting/subscribing nothing is
-    // ever sent. This is the #1 Kafka gotcha in NestJS.
-    await firstValueFrom(
-      this.kafka.emit(TOPICS.USER_CREATED, { key: user.id, value: event }),
-    );
-    this.logger.log(`published ${TOPICS.USER_CREATED} for ${user.id}`);
+      const event: UserCreatedEvent = {
+        userId: user.id,
+        email: user.email,
+        name: user.name,
+        createdAt: user.createdAt.toISOString(),
+      };
+      // key = userId, so all events for one user land on the same partition
+      // and are therefore consumed in order.
+      await this.outbox.record(manager, {
+        topic: TOPICS.USER_CREATED,
+        key: user.id,
+        payload: event as any,
+      });
 
-    return user;
+      this.logger.log(`created user ${user.id}`);
+      return user;
+    });
   }
 
   findAll(): Promise<User[]> {

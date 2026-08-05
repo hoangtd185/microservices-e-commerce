@@ -40,12 +40,12 @@ const STOCK = Number(process.env.STOCK || 100);
 const SKU = process.env.SKU || null;
 
 /** Wait until no order for this product is still PENDING. */
-async function waitForSagaToSettle(orderIds, timeoutMs) {
+async function waitForSagaToSettle(orderIds, token, timeoutMs) {
   return waitFor(
     `${orderIds.length} orders to settle`,
     async () => {
       const results = await Promise.all(
-        orderIds.map(async (id) => (await api.get(`/api/orders/${id}`)).body),
+        orderIds.map(async (id) => (await api.get(`/api/orders/${id}`, { token })).body),
       );
       const pending = results.filter((o) => o && o.status === 'PENDING');
       return pending.length === 0 ? results : null;
@@ -77,11 +77,11 @@ describe(
     const started = Date.now();
     const responses = await Promise.all(
       Array.from({ length: ORDERS }, () =>
-        api.post('/api/orders', {
-          userId: user.id,
-          productId: before.id,
-          quantity: QTY,
-        }),
+        api.post(
+          '/api/orders',
+          { productId: before.id, quantity: QTY },
+          { token: user.token },
+        ),
       ),
     );
     const postMs = Date.now() - started;
@@ -106,6 +106,7 @@ describe(
     const settleStarted = Date.now();
     const orders = await waitForSagaToSettle(
       accepted.map((r) => r.body.id),
+      user.token,
       Math.max(30000, ORDERS * 200),
     );
     const settleMs = Date.now() - settleStarted;
@@ -167,12 +168,13 @@ describe(
 
     const responses = await Promise.all(
       Array.from({ length: 20 }, () =>
-        api.post('/api/orders', { userId: user.id, productId: start.id, quantity: 1 }),
+        api.post('/api/orders', { productId: start.id, quantity: 1 }, { token: user.token }),
       ),
     );
 
     const orders = await waitForSagaToSettle(
       responses.map((r) => r.body.id),
+      user.token,
       30000,
     );
     const confirmed = orders.filter((o) => o.status === 'CONFIRMED');

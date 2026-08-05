@@ -7,14 +7,9 @@ import { OrdersService } from './orders.service';
 import { OrdersController } from './orders.controller';
 import { OrdersEventsController } from './orders.events.controller';
 import { RemoteService } from './remote.service';
-import { KafkaModule } from '../kafka/kafka.module';
 
 @Module({
-  imports: [
-    TypeOrmModule.forFeature([Order, IdempotencyKey]),
-    KafkaModule,
-    HttpModule,
-  ],
+  imports: [TypeOrmModule.forFeature([Order, IdempotencyKey]), HttpModule],
   controllers: [OrdersController, OrdersEventsController],
   providers: [OrdersService, RemoteService],
 })

@@ -50,10 +50,14 @@ const assert = {
 
 // ------------------------------------------------------------ http client --
 
-async function request(method, path, { body, headers = {} } = {}) {
+async function request(method, path, { body, headers = {}, token } = {}) {
   const res = await fetch(`${GATEWAY}${path}`, {
     method,
-    headers: { 'content-type': 'application/json', ...headers },
+    headers: {
+      'content-type': 'application/json',
+      ...(token ? { authorization: `Bearer ${token}` } : {}),
+      ...headers,
+    },
     body: body === undefined ? undefined : JSON.stringify(body),
   });
 
@@ -94,11 +98,11 @@ async function waitFor(describe, predicate, { timeoutMs = 15000, intervalMs = 25
   fail(`timed out after ${timeoutMs}ms waiting for: ${describe}`);
 }
 
-async function waitForOrderStatus(orderId, expected, opts) {
+async function waitForOrderStatus(orderId, expected, token, opts) {
   return waitFor(
     `order ${orderId.slice(0, 8)} to become ${expected}`,
     async () => {
-      const res = await api.get(`/api/orders/${orderId}`);
+      const res = await api.get(`/api/orders/${orderId}`, { token });
       return res.body && res.body.status === expected ? res.body : null;
     },
     opts,
@@ -109,16 +113,32 @@ const uuid = () => globalThis.crypto.randomUUID();
 
 // --------------------------------------------------------- domain helpers --
 
-/** Every test gets its own user so runs never interfere with each other. */
+/**
+ * Register a user and keep the token.
+ * Every test gets its own account so runs never interfere with each other.
+ * Returns { id, email, name, token } - `token` goes on every later call.
+ */
 async function createUser(label = 'tester') {
-  const res = await api.post('/api/users', {
-    email: `${label}+${uuid().slice(0, 8)}@example.com`,
+  const email = `${label}+${uuid().slice(0, 8)}@example.com`;
+  const password = 'correct-horse-battery-staple';
+
+  const res = await api.post('/api/auth/register', {
+    email,
     name: `Test ${label}`,
+    password,
   });
   if (res.status !== 201) {
-    fail(`could not create user (status ${res.status}): ${JSON.stringify(res.body)}`);
+    fail(`could not register (status ${res.status}): ${JSON.stringify(res.body)}`);
   }
-  return res.body;
+
+  return { ...res.body.user, token: res.body.accessToken, password };
+}
+
+/** An admin-ish token, for the endpoints that just need *some* valid caller. */
+let sharedToken = null;
+async function adminToken() {
+  if (!sharedToken) sharedToken = (await createUser('admin')).token;
+  return sharedToken;
 }
 
 async function getProductBySku(sku) {
@@ -140,12 +160,12 @@ async function getProductBySku(sku) {
  */
 async function createProduct({ stock = 100, price = 9.99, label = 'fixture' } = {}) {
   const sku = `TEST-${label}-${uuid().slice(0, 8)}`.toUpperCase();
-  const created = await api.post('/api/products', {
-    sku,
-    name: `Test fixture ${label}`,
-    price,
-    stock,
-  });
+  const token = await adminToken();
+  const created = await api.post(
+    '/api/products',
+    { sku, name: `Test fixture ${label}`, price, stock },
+    { token },
+  );
   if (created.status !== 201) {
     fail(`could not create product (status ${created.status}): ${JSON.stringify(created.body)}`);
   }
@@ -159,9 +179,29 @@ async function ensureStock(sku, target) {
   const product = await getProductBySku(sku);
   const missing = target - product.stock;
   if (missing > 0) {
-    await api.patch(`/api/products/${product.id}/restock`, { quantity: missing });
+    await api.patch(
+      `/api/products/${product.id}/restock`,
+      { quantity: missing },
+      { token: await adminToken() },
+    );
   }
   return getProductBySku(sku);
+}
+
+/**
+ * The outbox relay publishes asynchronously, so a status change can lag the
+ * HTTP response by a poll interval. Tests already poll via waitFor, so this is
+ * only used where we need the queue provably drained.
+ */
+async function waitForOrderSettled(orderId, token, opts) {
+  return waitFor(
+    `order ${orderId.slice(0, 8)} to leave PENDING`,
+    async () => {
+      const res = await api.get(`/api/orders/${orderId}`, { token });
+      return res.body && res.body.status !== 'PENDING' ? res.body : null;
+    },
+    opts,
+  );
 }
 
 // ------------------------------------------------------------- test runner -
@@ -242,7 +282,9 @@ module.exports = {
   run,
   waitFor,
   waitForOrderStatus,
+  waitForOrderSettled,
   createUser,
+  adminToken,
   createProduct,
   getProductBySku,
   ensureStock,

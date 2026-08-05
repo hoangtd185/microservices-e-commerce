@@ -1,22 +1,18 @@
 import { createHash } from 'crypto';
 import {
   ConflictException,
-  Inject,
   Injectable,
   Logger,
   NotFoundException,
-  OnModuleInit,
   UnprocessableEntityException,
 } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
-import { ClientKafka } from '@nestjs/microservices';
-import { firstValueFrom } from 'rxjs';
-import { DataSource, Repository } from 'typeorm';
+import { DataSource, EntityManager, Repository } from 'typeorm';
 import { Order, OrderStatus } from './order.entity';
 import { IdempotencyKey } from './idempotency-key.entity';
 import { CreateOrderDto } from './dto/create-order.dto';
 import { RemoteService } from './remote.service';
-import { KAFKA_PRODUCER } from '../kafka/kafka.module';
+import { OutboxService } from '../outbox/outbox.service';
 import {
   TOPICS,
   OrderCreatedEvent,
@@ -35,33 +31,34 @@ export interface CreateOrderResult {
 }
 
 @Injectable()
-export class OrdersService implements OnModuleInit {
+export class OrdersService {
   private readonly logger = new Logger(OrdersService.name);
 
   constructor(
     @InjectRepository(Order) private readonly repo: Repository<Order>,
-    @Inject(KAFKA_PRODUCER) private readonly kafka: ClientKafka,
     private readonly remote: RemoteService,
     private readonly dataSource: DataSource,
+    private readonly outbox: OutboxService,
   ) {}
-
-  async onModuleInit() {
-    await this.kafka.connect();
-  }
 
   /**
    * Step 1 of the saga: validate synchronously, persist as PENDING, announce.
    * We never wait for inventory - the HTTP response returns immediately.
+   *
+   * Note there is no Kafka call anywhere in this path any more. The event is
+   * written to the outbox in the same transaction as the order, so the request
+   * never waits on a broker round trip, and a crash can no longer lose it.
    */
   async create(
     dto: CreateOrderDto,
+    userId: string,
     idempotencyKey?: string,
   ): Promise<CreateOrderResult> {
-    await this.remote.getUser(dto.userId);
+    await this.remote.getUser(userId);
     const product = await this.remote.getProduct(dto.productId);
 
     const draft = {
-      userId: dto.userId,
+      userId,
       productId: dto.productId,
       quantity: dto.quantity,
       unitPrice: product.price,
@@ -69,21 +66,38 @@ export class OrdersService implements OnModuleInit {
       status: OrderStatus.PENDING,
     };
 
-    const result = idempotencyKey
-      ? await this.createIdempotent(draft, dto, idempotencyKey)
-      : { order: await this.repo.save(this.repo.create(draft)), replayed: false };
-
-    // A replay must not publish a second order.created - the first request
-    // already did, and inventory has already decided.
-    if (!result.replayed) {
-      await this.publishOrderCreated(result.order);
+    if (idempotencyKey) {
+      return this.createIdempotent(draft, userId, dto, idempotencyKey);
     }
 
-    return result;
+    return this.dataSource.transaction(async (manager) => {
+      const order = await manager.save(manager.create(Order, draft));
+      await this.recordOrderCreated(manager, order);
+      return { order, replayed: false };
+    });
+  }
+
+  private async recordOrderCreated(manager: EntityManager, order: Order): Promise<void> {
+    const event: OrderCreatedEvent = {
+      orderId: order.id,
+      userId: order.userId,
+      productId: order.productId,
+      quantity: order.quantity,
+      unitPrice: Number(order.unitPrice),
+      totalPrice: Number(order.totalPrice),
+      createdAt: order.createdAt.toISOString(),
+    };
+    await this.outbox.record(manager, {
+      topic: TOPICS.ORDER_CREATED,
+      key: order.id,
+      payload: event as any,
+    });
+    this.logger.log(`order ${order.id} accepted (${TOPICS.ORDER_CREATED} queued)`);
   }
 
   private async createIdempotent(
     draft: Partial<Order>,
+    userId: string,
     dto: CreateOrderDto,
     key: string,
   ): Promise<CreateOrderResult> {
@@ -92,7 +106,7 @@ export class OrdersService implements OnModuleInit {
     const requestHash = createHash('sha256')
       .update(
         JSON.stringify({
-          userId: dto.userId,
+          userId,
           productId: dto.productId,
           quantity: dto.quantity,
         }),
@@ -132,29 +146,14 @@ export class OrdersService implements OnModuleInit {
         return { order, replayed: true };
       }
 
-      // Same transaction as the key: either both land or neither does.
+      // One transaction, three writes, all cheap: the key, the order, and the
+      // event. Either all of it happened or none of it did.
       const order = await manager.save(manager.create(Order, draft));
       await manager.update(IdempotencyKey, { key }, { orderId: order.id });
+      await this.recordOrderCreated(manager, order);
 
       return { order, replayed: false };
     });
-  }
-
-  private async publishOrderCreated(order: Order): Promise<void> {
-    const event: OrderCreatedEvent = {
-      orderId: order.id,
-      userId: order.userId,
-      productId: order.productId,
-      quantity: order.quantity,
-      unitPrice: Number(order.unitPrice),
-      totalPrice: Number(order.totalPrice),
-      createdAt: order.createdAt.toISOString(),
-    };
-    // emit() is a cold observable - awaiting it is what actually publishes.
-    await firstValueFrom(
-      this.kafka.emit(TOPICS.ORDER_CREATED, { key: order.id, value: event }),
-    );
-    this.logger.log(`-> ${TOPICS.ORDER_CREATED} ${order.id}`);
   }
 
   findAll(userId?: string): Promise<Order[]> {
@@ -172,61 +171,72 @@ export class OrdersService implements OnModuleInit {
 
   /** Step 3a: inventory said yes. */
   async confirm(event: InventoryReservedEvent): Promise<void> {
-    const order = await this.repo.findOne({ where: { id: event.orderId } });
-    if (!order) {
-      this.logger.warn(`inventory.reserved for unknown order ${event.orderId}`);
-      return;
-    }
-    // Idempotency: Kafka guarantees at-least-once, so this event can arrive
-    // more than once. Only a PENDING order may transition.
-    if (order.status !== OrderStatus.PENDING) {
-      this.logger.log(`order ${order.id} already ${order.status}, ignoring`);
-      return;
-    }
-
-    order.status = OrderStatus.CONFIRMED;
-    order.statusReason = null;
-    await this.repo.save(order);
-
-    const confirmed: OrderConfirmedEvent = {
-      orderId: order.id,
-      userId: order.userId,
-      productId: order.productId,
-      quantity: order.quantity,
-      totalPrice: Number(order.totalPrice),
-    };
-    await firstValueFrom(
-      this.kafka.emit(TOPICS.ORDER_CONFIRMED, { key: order.id, value: confirmed }),
+    await this.transition(
+      event.orderId,
+      OrderStatus.CONFIRMED,
+      null,
+      TOPICS.ORDER_CONFIRMED,
+      (order): OrderConfirmedEvent => ({
+        orderId: order.id,
+        userId: order.userId,
+        productId: order.productId,
+        quantity: order.quantity,
+        totalPrice: Number(order.totalPrice),
+      }),
     );
-    this.logger.log(`-> ${TOPICS.ORDER_CONFIRMED} ${order.id}`);
   }
 
   /** Step 3b: inventory said no -> compensating action. */
   async cancel(event: InventoryRejectedEvent): Promise<void> {
-    const order = await this.repo.findOne({ where: { id: event.orderId } });
-    if (!order) {
-      this.logger.warn(`inventory.rejected for unknown order ${event.orderId}`);
-      return;
-    }
-    if (order.status !== OrderStatus.PENDING) {
-      this.logger.log(`order ${order.id} already ${order.status}, ignoring`);
-      return;
-    }
-
-    order.status = OrderStatus.CANCELLED;
-    order.statusReason = event.reason;
-    await this.repo.save(order);
-
-    const cancelled: OrderCancelledEvent = {
-      orderId: order.id,
-      userId: order.userId,
-      productId: order.productId,
-      quantity: order.quantity,
-      reason: event.reason,
-    };
-    await firstValueFrom(
-      this.kafka.emit(TOPICS.ORDER_CANCELLED, { key: order.id, value: cancelled }),
+    await this.transition(
+      event.orderId,
+      OrderStatus.CANCELLED,
+      event.reason,
+      TOPICS.ORDER_CANCELLED,
+      (order): OrderCancelledEvent => ({
+        orderId: order.id,
+        userId: order.userId,
+        productId: order.productId,
+        quantity: order.quantity,
+        reason: event.reason,
+      }),
     );
-    this.logger.log(`-> ${TOPICS.ORDER_CANCELLED} ${order.id} (${event.reason})`);
+  }
+
+  /**
+   * Move a PENDING order to a terminal state and queue the resulting event,
+   * both in one short transaction.
+   *
+   * Idempotency: Kafka is at-least-once, so this can run twice for the same
+   * event. Only a PENDING order may transition, so the second run is a no-op
+   * and does not queue a duplicate event.
+   */
+  private async transition(
+    orderId: string,
+    status: OrderStatus,
+    reason: string | null,
+    topic: string,
+    buildEvent: (order: Order) => Record<string, any>,
+  ): Promise<void> {
+    await this.dataSource.transaction(async (manager) => {
+      const updated = await manager.update(
+        Order,
+        { id: orderId, status: OrderStatus.PENDING },
+        { status, statusReason: reason },
+      );
+
+      if (!updated.affected) {
+        this.logger.log(`order ${orderId} is not PENDING, ignoring`);
+        return;
+      }
+
+      const order = await manager.findOne(Order, { where: { id: orderId } });
+      await this.outbox.record(manager, {
+        topic,
+        key: order.id,
+        payload: buildEvent(order),
+      });
+      this.logger.log(`order ${order.id} -> ${status} (${topic} queued)`);
+    });
   }
 }

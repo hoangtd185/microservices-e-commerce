@@ -1,9 +1,18 @@
 import { randomUUID } from 'crypto';
-import { All, Controller, Logger, Req, Res } from '@nestjs/common';
+import {
+  All,
+  Controller,
+  Logger,
+  Req,
+  Res,
+  UnauthorizedException,
+} from '@nestjs/common';
 import { HttpService } from '@nestjs/axios';
 import { firstValueFrom } from 'rxjs';
 import type { Request, Response } from 'express';
 import { ROUTES } from './routes';
+import { IdentityService, Identity } from './auth/identity.service';
+import { isPublic } from './auth/public-routes';
 
 const METHODS_WITHOUT_BODY = ['GET', 'HEAD', 'DELETE', 'OPTIONS'];
 
@@ -19,10 +28,17 @@ const METHODS_WITHOUT_BODY = ['GET', 'HEAD', 'DELETE', 'OPTIONS'];
 export class ProxyController {
   private readonly logger = new Logger('Gateway');
 
-  constructor(private readonly http: HttpService) {}
+  constructor(
+    private readonly http: HttpService,
+    private readonly identity: IdentityService,
+  ) {}
 
   @All('api/*')
   async proxy(@Req() req: Request, @Res() res: Response) {
+    // FIRST, before any routing decision: drop identity headers the client
+    // sent. Anything x-user-* from now on was put there by this gateway.
+    this.identity.stripSpoofedHeaders(req);
+
     const rule = ROUTES.find(
       (r) => req.path === r.prefix || req.path.startsWith(`${r.prefix}/`),
     );
@@ -34,6 +50,19 @@ export class ProxyController {
         availableRoutes: ROUTES.map((r) => r.prefix),
       });
       return;
+    }
+
+    // Deny by default: everything needs a token unless explicitly public.
+    let caller: Identity | null = null;
+    if (!isPublic(req.method, req.path)) {
+      try {
+        caller = this.identity.verify(req);
+      } catch (err) {
+        const message =
+          err instanceof UnauthorizedException ? err.message : 'Unauthorized';
+        res.status(401).json({ statusCode: 401, message });
+        return;
+      }
     }
 
     const requestId = (req.headers['x-request-id'] as string) ?? randomUUID();
@@ -51,9 +80,9 @@ export class ProxyController {
           headers: {
             'content-type': 'application/json',
             'x-request-id': requestId,
-            ...(req.headers.authorization
-              ? { authorization: req.headers.authorization }
-              : {}),
+            // The proven identity. Services trust these because only this
+            // gateway can set them.
+            ...(caller ? this.identity.headersFor(caller) : {}),
             // Must be forwarded or the client's retry protection silently
             // stops working at the gateway.
             ...(req.headers['idempotency-key']
@@ -66,7 +95,8 @@ export class ProxyController {
       );
 
       this.logger.log(
-        `${req.method} ${req.path} -> ${rule.name}${rule.rewrite}${suffix} [${upstream.status}]`,
+        `${req.method} ${req.path} -> ${rule.name}${rule.rewrite}${suffix} ` +
+          `[${upstream.status}]${caller ? ` user=${caller.userId.slice(0, 8)}` : ' anon'}`,
       );
 
       res

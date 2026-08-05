@@ -2,6 +2,7 @@ import { Module } from '@nestjs/common';
 import { ConfigModule } from '@nestjs/config';
 import { TypeOrmModule } from '@nestjs/typeorm';
 import { OrdersModule } from './orders/orders.module';
+import { OutboxModule } from './outbox/outbox.module';
 import { HealthController } from './health.controller';
 
 @Module({
@@ -19,6 +20,7 @@ import { HealthController } from './health.controller';
       retryAttempts: 20,
       retryDelay: 3000,
     }),
+    OutboxModule,
     OrdersModule,
   ],
   controllers: [HealthController],

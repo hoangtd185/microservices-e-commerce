@@ -15,6 +15,12 @@ export interface RouteRule {
 export const ROUTES: RouteRule[] = [
   {
     name: 'user-service',
+    prefix: '/api/auth',
+    target: process.env.USER_SERVICE_URL ?? 'http://localhost:3001',
+    rewrite: '/auth',
+  },
+  {
+    name: 'user-service',
     prefix: '/api/users',
     target: process.env.USER_SERVICE_URL ?? 'http://localhost:3001',
     rewrite: '/users',
