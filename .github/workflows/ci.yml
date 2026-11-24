@@ -1,0 +1,134 @@
+# CI/CD for Shopee-lite.
+#
+#   build    compile every service on its own (each one is standalone)
+#   uat      boot the real stack - Postgres, Kafka, five services - and run the
+#            acceptance suites through the gateway, exactly as a client would
+#   publish  main only, after UAT passes: push one image per service to GHCR
+#
+# UAT runs against real infrastructure on purpose. The bugs this project has
+# actually had (TypeORM's UPDATE result shape, a dropped header, overselling)
+# only show up with a real database and a real broker.
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+# A newer push to the same branch makes the older run pointless.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  NODE_VERSION: '20' # matches node:20-alpine in the Dockerfiles
+
+jobs:
+  build:
+    name: build (${{ matrix.service }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        service:
+          - api-gateway
+          - user-service
+          - order-service
+          - inventory-service
+          - notification-service
+    defaults:
+      run:
+        working-directory: services/${{ matrix.service }}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+      # No lockfiles in the repo yet, so `npm install` rather than `npm ci`.
+      # Committing package-lock.json per service would make builds reproducible.
+      - run: npm install --no-audit --no-fund
+      - run: npm run build
+
+  uat:
+    name: uat (e2e + concurrency)
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    env:
+      # Throwaway secret per run, so nothing in CI depends on the dev default.
+      JWT_SECRET: ci-${{ github.run_id }}-${{ github.run_attempt }}
+      GATEWAY_URL: http://localhost:3000
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      # kafka-ui is left out: nobody looks at it in CI.
+      - name: Start the stack
+        run: >
+          docker compose up -d --build --wait --wait-timeout 300
+          postgres kafka user-service order-service inventory-service
+          notification-service api-gateway
+
+      - name: Wait until it can serve requests
+        run: ./scripts/ci/wait-for-stack.sh
+
+      - name: Acceptance tests (e2e)
+        run: npm test
+
+      - name: Concurrency invariants (oversell / lost update)
+        run: npm run test:load
+
+      - name: Diagnostics
+        if: failure()
+        run: |
+          docker compose ps
+          docker compose logs --no-color --tail=300 \
+            api-gateway user-service order-service inventory-service notification-service
+
+      - name: Tear down
+        if: always()
+        run: docker compose down -v
+
+  publish:
+    name: publish (${{ matrix.service }})
+    needs: uat
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      matrix:
+        service:
+          - api-gateway
+          - user-service
+          - order-service
+          - inventory-service
+          - notification-service
+    env:
+      SERVICE: ${{ matrix.service }}
+    steps:
+      - uses: actions/checkout@v6
+      - name: Log in to GHCR
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: echo "$GHCR_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+      - name: Build and push
+        run: |
+          # GHCR requires lowercase names.
+          image="ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/shopee-lite-${SERVICE}"
+          docker build \
+            --label "org.opencontainers.image.source=https://github.com/${GITHUB_REPOSITORY}" \
+            --label "org.opencontainers.image.revision=${GITHUB_SHA}" \
+            -t "${image}:${GITHUB_SHA::7}" -t "${image}:latest" \
+            "services/${SERVICE}"
+          docker push --all-tags "${image}"
+          echo "pushed ${image}:${GITHUB_SHA::7}" >> "$GITHUB_STEP_SUMMARY"
